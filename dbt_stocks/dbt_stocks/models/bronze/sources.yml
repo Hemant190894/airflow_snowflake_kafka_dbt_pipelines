@@ -1,0 +1,8 @@
+version: 2
+sources:
+  - name: raw
+    database: stock_mds
+    schema: common
+    tables:
+      - name: bronze_stock_quotes_raw
+    
