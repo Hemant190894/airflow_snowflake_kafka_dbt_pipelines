@@ -13,11 +13,17 @@ Gold: Aggregated and curated data for analytics.
 The pipeline uses dbt for all transformations, ensuring a maintainable and version-controlled approach to data quality.
 
 # Tech Stack
-**Orchestration: Apache Airflow
+
+Orchestration: Apache Airflow
+
 Real-Time Data: Apache Kafka
+
 Data Lake: MinIO
+
 Data Warehouse: Snowflake
+
 Transformation: dbt (Data Build Tool)
+
 Containerization: Docker
-Cloud/S3 Client: Boto3 (orchestrated via custom modules)
-**
+
+Cloud/S3 Client: Boto3 (orchestrated via custom modules) 
