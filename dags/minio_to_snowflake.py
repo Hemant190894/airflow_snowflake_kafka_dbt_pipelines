@@ -135,51 +135,18 @@ default_args = {
 with DAG(
     "minio_to_snowflake",
     default_args=default_args,
-    schedule_interval="*/5 * * * *",
+    schedule_interval="*/1 * * * *",
     catchup=False,
 ) as dag:
     
-    # task1 = PythonOperator(
-    #     task_id="download_minio",
-    #     python_callable=download_from_minio,
-    # )
-
-    # task2 = PythonOperator(
-    #     task_id="load_snowflake",
-    #     python_callable=load_to_snowflake,
-    # )
-
-    # task1 >> task2
-    
-    # Step 1: Run producer.py -> Push stock data to Kafka
-    run_producer = BashOperator(
-        task_id="run_producer",
-        bash_command="cd /opt/airflow/kafka_producer && python3 producer.py",
-    )
-
-    # Step 2: Run consumer.py -> Consume from Kafka, save to MinIO
-    run_consumer = BashOperator(
-        task_id="run_consumer",
-        bash_command="cd /opt/airflow/kafka_consumer && python3 consumer.py",
-    )
-
-    # Step 3: Download from MinIO -> Local
-    download_task = PythonOperator(
+    task1 = PythonOperator(
         task_id="download_minio",
         python_callable=download_from_minio,
     )
 
-    # Step 4: Load to Snowflake
-    load_task = PythonOperator(
+    task2 = PythonOperator(
         task_id="load_snowflake",
         python_callable=load_to_snowflake,
     )
 
-    # Step 5: Run dbt (Bronze → Silver → Gold)
-    run_dbt = BashOperator(
-        task_id="run_dbt",
-        bash_command="cd /opt/airflow/dbt_stocks/dbt_stocks && dbt run",
-    )
-
-    # Pipeline order
-    run_producer >> run_consumer >> download_task >> load_task >> run_dbt
+    task1 >> task2

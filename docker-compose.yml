@@ -1,4 +1,3 @@
-
 version: "3.8"
 services:
   zookeeper:
@@ -46,12 +45,13 @@ services:
       - "9001:9001"  # Console UI
       - "9002:9000"  # S3 API
     environment:
-      MINIO_ROOT_USER: hemant
-      MINIO_ROOT_PASSWORD: hemant1908
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     command: server /data --console-address ":9001"
 
   airflow-webserver:
-    image: apache/airflow:2.9.3
+    build: .
+    image: my-airflow-image:latest
     container_name: airflow-webserver
     restart: always
     depends_on:
@@ -64,15 +64,16 @@ services:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
-      - ./kafka_producer:/opt/airflow/kafka_producer   # <--- NEW
-      - ./kafka_consumer:/opt/airflow/kafka_consumer   # <--- NEW
-      - ./dbt_stocks:/opt/airflow/dbt_stocks           # <--- NEW
+      - ./kafka_producer:/opt/airflow/kafka_producer
+      - ./kafka_consumer:/opt/airflow/kafka_consumer
+      - ./dbt_stocks:/opt/airflow/dbt_stocks
     ports:
     - "8081:8080"
     command: webserver
 
   airflow-scheduler:
-    image: apache/airflow:2.9.3
+    build: .
+    image: my-airflow-image:latest
     container_name: airflow-scheduler
     restart: always
     depends_on:
@@ -84,10 +85,9 @@ services:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
-      - ./kafka_producer:/opt/airflow/kafka_producer   # <--- NEW
-      - ./kafka_consumer:/opt/airflow/kafka_consumer   # <--- NEW
-      - ./dbt_stocks:/opt/airflow/dbt_stocks           # <--- NEW
-
+      - ./kafka_producer:/opt/airflow/kafka_producer
+      - ./kafka_consumer:/opt/airflow/kafka_consumer
+      - ./dbt_stocks:/opt/airflow/dbt_stocks
     command: scheduler
 
   postgres:
@@ -104,25 +104,35 @@ services:
     - "5433:5432"
 
   airflow-init:
-      image: apache/airflow:2.9.3
+      build: .
+      image: my-airflow-image:latest
       container_name: airflow-init
       depends_on:
         - postgres
       environment:
         - AIRFLOW__CORE__LOAD_EXAMPLES=False
         - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+        - AIRFLOW_USER_CREATE_USERNAME=${AIRFLOW_USER}
+        - AIRFLOW_USER_CREATE_PASSWORD=${AIRFLOW_PASSWORD}
+        - AIRFLOW_USER_CREATE_FIRSTNAME=${AIRFLOW_FIRSTNAME}
+        - AIRFLOW_USER_CREATE_LASTNAME=${AIRFLOW_LASTNAME}
+        - AIRFLOW_USER_CREATE_EMAIL=${AIRFLOW_EMAIL}
       command: >
         bash -c "
         airflow db migrate &&
-        airflow users create --username hemant --firstname Hemant --lastname Dayma --role Admin --email daymahemant4@gmail.com --password hemant1908
+        airflow users create \
+        --username ${AIRFLOW_USER} \
+        --firstname ${AIRFLOW_FIRSTNAME} \
+        --lastname ${AIRFLOW_LASTNAME} \
+        --role Admin \
+        --email ${AIRFLOW_EMAIL} \
+        --password ${AIRFLOW_PASSWORD}
         "
       volumes:
         - ./dags:/opt/airflow/dags
         - ./logs:/opt/airflow/logs
         - ./plugins:/opt/airflow/plugins
-      restart: "no" # This is important. It should not restart after it completes its job.
+      restart: "no"
 
 volumes:
   postgres_data:
-
-  

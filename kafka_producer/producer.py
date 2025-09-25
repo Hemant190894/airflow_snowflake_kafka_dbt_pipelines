@@ -1,105 +1,153 @@
-import time
-import requests
-import json
-from kafka import KafkaProducer
-from datetime import datetime
-from dotenv import load_dotenv
-import os
+import os, sys
+import boto3
+import snowflake.connector
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.operators.bash import BashOperator
+from airflow.models import Variable
+from airflow.hooks.base import BaseHook
+from datetime import datetime, timedelta
 
-# Load environment variables from a .env file
-load_dotenv()
-
-# --- Configuration from Environment Variables ---
-# API key for authentication with the Finnhub API
-API_KEY = os.getenv('API_KEY')
-
-# Base URL for the Finnhub stock quotes API endpoint
-BASE_URL = os.getenv('BASE_URL')
-
-# Kafka broker address and topic name from environment variables
-KAFKA_BROKER = os.getenv('KAFKA_BROKER')
-KAFKA_TOPIC = os.getenv('KAFKA_TOPIC')
-
-# List of stock symbols to fetch data for
-SYMBOLS = ['AAPL', 'GOOGL', 'MSFT', 'TSLA']  
-# Fetch data every 60 seconds (default value if not in .env)
-FETCH_INTERVAL = int(os.getenv('FETCH_INTERVAL',60))  
-
-# Initialize the Kafka producer
-# The bootstrap_servers parameter specifies the Kafka broker to connect to.
-# The value_serializer converts the Python dictionary to a JSON string and encodes it to UTF-8 bytes.
-producer = KafkaProducer(
-    bootstrap_servers=["localhost:29092"],
-    value_serializer=lambda v: json.dumps(v).encode('utf-8')
-)
-
-def fetch_stock_data(symbol):
+def get_minio_prefix():
     """
-    Fetches real-time stock data for a given symbol from the Finnhub API.
-
-    Args:
-        symbol (str): The stock ticker symbol (e.g., 'AAPL').
-
-    Returns:
-        dict or None: A dictionary containing the formatted stock data if the request is successful,
-                      otherwise returns None.
+    Constructs the MinIO prefix based on the current date.
     """
-    # Construct the full API URL with the symbol and API key
-    url = f"{BASE_URL}?symbol={symbol}&token={API_KEY}"
-    print(f"Fetching data for {symbol} from {url}")
+    execution_date = datetime.now()
+    prefix = f"bronze/AAPL/{execution_date.strftime('%Y-%m-%d')}/"
+    return prefix
+
+def download_from_minio(**kwargs):
+    """
+    Downloads all objects from a MinIO bucket to a local directory.
+    Uses Airflow Connections and Variables.
+    """
+    minio_conn = BaseHook.get_connection('minio_conn')
+    bucket = Variable.get("minio_bucket")
+    local_dir = Variable.get("local_dir")
+    prefix = get_minio_prefix()
+
+    print(f"Connecting to MinIO with endpoint: {minio_conn.host}")
     
-    # Make a GET request to the API endpoint
-    response = requests.get(url)
-    print(f"Response status: {response.status_code}")
+    try:
+        os.makedirs(local_dir, exist_ok=True)
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=minio_conn.host,
+            aws_access_key_id=minio_conn.login,
+            aws_secret_access_key=minio_conn.password
+        )
+        
+        print(f"Connected to MinIO, accessing bucket: {bucket} with prefix: {prefix}")
+        
+        # New logging to check for files
+        print(f"Searching for files with prefix: {prefix} in bucket: {bucket}")
+        
+        objects = s3.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])
+
+        if not objects:
+            print(f"No objects found with prefix: {prefix}")
+            return []
+
+        # New logging to show the files found
+        print(f"Found the following objects in MinIO: {objects}")
+
+        local_files = []
+        
+        for obj in objects:
+            key = obj["Key"]
+            if not key.endswith('/'):
+                local_file = os.path.join(local_dir, os.path.basename(key))
+                s3.download_file(bucket, key, local_file)
+                print(f"Downloaded {key} -> {local_file}")
+                local_files.append(local_file)
+        
+        print(f"Found {len(local_files)} file(s) in MinIO bucket {bucket}")
+        return local_files
+    except Exception as e:
+        print(f"Error during MinIO download: {e}", file=sys.stderr)
+        return []
+
+def load_to_snowflake(**kwargs):
+    """
+    Loads downloaded files from the local directory into a Snowflake table.
+    Uses Airflow Connections and XCom.
+    """
+    local_files = kwargs['ti'].xcom_pull(task_ids='download_minio')
+
+    print(f"Files to load: {local_files}")
+    if not local_files:
+        print("No files to load. Exiting.")
+        return
+
+    conn = None
+    cur = None
+    try:
+        snowflake_conn = BaseHook.get_connection('snowflake_conn')
+        
+        user = snowflake_conn.login
+        password = snowflake_conn.password
+        account = snowflake_conn.extra_dejson.get('account')
+        warehouse = snowflake_conn.extra_dejson.get('warehouse')
+        database = snowflake_conn.extra_dejson.get('database')
+        schema = snowflake_conn.extra_dejson.get('schema')
+
+        print(f"Connecting to Snowflake with user: {user}")
+        print(f"Using account: {account}")
+        
+        conn = snowflake.connector.connect(
+            user=user,
+            password=password,
+            account=account,
+            warehouse=warehouse,
+            database=database,
+            schema=schema
+        )
+        cur = conn.cursor()
+
+        for f in local_files:
+            res = cur.execute(f"PUT file://{f} @{database}.{schema}.%bronze_stock_quotes_raw").fetchall()
+            print(f"PUT result for {f}: {res}")
+
+        res = cur.execute(f"""
+            COPY INTO {database}.{schema}.bronze_stock_quotes_raw
+            FROM @{database}.{schema}.%bronze_stock_quotes_raw
+            FILE_FORMAT = (TYPE=JSON)
+        """).fetchall()
+        print(f"COPY INTO result: {res}")
+
+    except Exception as e:
+        print(f"Error during Snowflake load: {e}", file=sys.stderr)
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "start_date": datetime(2025, 9, 24),
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+with DAG(
+    "minio_to_snowflake",
+    default_args=default_args,
+    schedule_interval="*/5 * * * *",
+    catchup=False,
+) as dag:
     
-    # Check if the API request was successful (status code 200)
-    if response.status_code == 200:
-        data = response.json()
-        
-        # Create a new dictionary with user-friendly key names and a formatted timestamp
-        renamed_data = {
-            'current_price': data.get('c'),
-            'change': data.get('d'),
-            'percent_change': data.get('dp'),
-            'high': data.get('h'),
-            'low': data.get('l'),
-            'open': data.get('o'),
-            'previous_close_price': data.get('pc'),
-            'symbol': symbol,
-            'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        
-        return renamed_data
-    else:
-        # Print an error message if the API request failed
-        print(f"Error fetching data for {symbol}: {response.status_code}")
-        return None
+    task1 = PythonOperator(
+        task_id="download_minio",
+        python_callable=download_from_minio,
+    )
 
-def producer_main():
-    """
-    Main function to continuously fetch stock data and send it to Kafka.
-    """
-    # Infinite loop to keep the script running
-    while True:
-        try:
-            # Iterate through each stock symbol in the list
-            for symbol in SYMBOLS:
-                stock_data = fetch_stock_data(symbol)
-                
-                # If data was successfully fetched, send it to the Kafka topic
-                if stock_data:
-                    print(f"Fetched data for {symbol}: {stock_data}")
-                    producer.send(KAFKA_TOPIC, value=stock_data)
-                    print(f"Sent data to Kafka for {symbol}")
-            
-            # Wait for the specified interval before fetching the next set of data
-            time.sleep(int(FETCH_INTERVAL))
-        
-        except Exception as e:
-            # Catch and print any exceptions that occur to prevent the script from crashing
-            print(f"An error occurred: {e}")
-            time.sleep(5)  # Wait a few seconds before retrying
+    task2 = PythonOperator(
+        task_id="load_snowflake",
+        python_callable=load_to_snowflake,
+    )
 
-# Entry point for the script
-if __name__ == "__main__":
-    producer_main()
+    task1 >> task2
+    
